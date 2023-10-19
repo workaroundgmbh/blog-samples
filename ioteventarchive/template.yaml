@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: 'AWS::Serverless-2016-10-31'
+
+Resources:
+
+##########################################################
+# Custom event bus for IoT events                        #
+##########################################################
+
+  IotEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: iot-event-bus
+
+##########################################################
+# S3 bucket for storing events                           #
+##########################################################
+
+  EventArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "ioteventarchive-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+##########################################################
+# deadletter queue                                       #
+##########################################################
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: iot-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: type
+          Value: dead-letter-queue
+
+##########################################################
+# iot-ingestion event trigger rule                       #
+##########################################################
+
+  IotIngestionRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: iot_ingestion_rule
+      TopicRulePayload:
+        AwsIotSqlVersion: "2016-03-23"
+        RuleDisabled: false
+        Sql: SELECT timestamp() as time_received FROM 'iot/+'
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt IngestionLambda.Arn
+
+  IngestionQueuePublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: iot-ingestion-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - iot.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: iot-ingestion-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: !GetAtt IngestionLambda.Arn
+
+##########################################################
+# Lambda function for processing IoT events              #
+##########################################################
+
+  IngestionLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: iot-ingestion-lambda
+      Description: "Function to be invoked directly by IoT Core for processing event data."
+      CodeUri: ./src/IngestionLambda
+      Handler: handler.lambda_handler
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:46"
+      Environment:
+        Variables:
+          EVENT_BUS_ARN: !GetAtt IotEventBus.Arn
+          POWERTOOLS_SERVICE_NAME: iotingestion
+          LOG_LEVEL: INFO
+      EventInvokeConfig:
+        DestinationConfig:
+            OnFailure:
+              Type: SQS
+              Destination: !GetAtt DeadLetterQueue.Arn
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "sqs:SendMessage"
+              Resource: !GetAtt DeadLetterQueue.Arn
+            - Effect: Allow
+              Action:
+                - "cloudwatch:PutMetricData"
+              Resource: "*"
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt IotEventBus.Arn
+
+  IngestionLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt IngestionLambda.Arn
+      Principal: iot.amazonaws.com
+      SourceAccount: !Sub "${AWS::AccountId}"
+      SourceArn: !GetAtt IotIngestionRule.Arn
+
+  IngestionLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${IngestionLambda}"
+      RetentionInDays: 90
+
+##########################################################
+# iot-ingestion event trigger rule                       #
+##########################################################
+
+  IngestionRule: 
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ioteventarchive-ingestion-trigger
+      Description: |
+        This rule taps into the iot-ingestion events to archive them by sending them 
+        off to Kinesis Data Firehose.
+      EventBusName: !GetAtt IotEventBus.Arn
+      EventPattern: 
+        source: 
+          - iot.ingestion
+        detail-type: 
+          - scan-event
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: !GetAtt IotEventDeliveryStream.Arn
+          Id: TargetIngestion
+          RoleArn: !GetAtt IngestionRuleRole.Arn
+          InputPath: $.detail
+          DeadLetterConfig:
+            Arn: !GetAtt DeadLetterQueue.Arn
+
+  IngestionRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: PutEventsDestinationBus
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource:
+                  - !GetAtt IotEventDeliveryStream.Arn
+
+##########################################################
+# event ingestion and processing                         #
+##########################################################
+
+  IotEventDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: ioteventarchive-ingestion
+      DeliveryStreamType: DirectPut
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt EventArchiveBucket.Arn
+        BufferingHints:
+          SizeInMBs: 64
+          IntervalInSeconds: 60
+        RoleARN: !GetAtt IngestionDeliveryStreamRole.Arn
+        CompressionFormat: GZIP
+        Prefix: data/year=!{partitionKeyFromQuery:year}/month=!{partitionKeyFromQuery:month}/day=!{partitionKeyFromQuery:day}/
+        ErrorOutputPrefix: ingestion-failed/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 60
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+          - Type: MetadataExtraction
+            Parameters:
+            - ParameterName: MetadataExtractionQuery
+              ParameterValue: '{year : ((.time_received / 1000) | strftime("%Y")), month : ((.time_received / 1000) | strftime("%m")), day : ((.time_received / 1000) | strftime("%d"))}'
+            - ParameterName: JsonParsingEngine
+              ParameterValue: JQ-1.6
+          - Type: AppendDelimiterToRecord
+            Parameters:
+            - ParameterName: Delimiter
+              ParameterValue: "\\n"
+
+  IngestionDeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ioteventarchive-ingestion-role
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: firehose.amazonaws.com
+          Sid: AllowFirehoseAssumeRole
+        Version: 2012-10-17
+      Policies:
+        - PolicyName: ioteventarchive-ingestion-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                - s3:AbortMultipartUpload
+                - s3:GetBucketLocation
+                - s3:GetObject
+                - s3:ListBucket
+                - s3:ListBucketMultipartUploads
+                - s3:PutObject
+                Effect: Allow
+                Resource:
+                  - !Sub "arn:aws:s3:::${EventArchiveBucket}"
+                  - !Sub "arn:aws:s3:::${EventArchiveBucket}/*"
