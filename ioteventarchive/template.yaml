@@ -92,7 +92,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: "iot-ingestion-lambda"
-      Description: "Function to be invoked directly by IoT Core for processing scan data."
+      Description: "Function to be invoked directly by IoT Core for processing event data."
       CodeUri: "./src/IngestionLambda"
       Handler: "handler.lambda_handler"
       Runtime: python3.9
