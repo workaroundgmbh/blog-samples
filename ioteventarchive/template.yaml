@@ -53,11 +53,11 @@ Resources:
   IotIngestionRule:
     Type: AWS::IoT::TopicRule
     Properties:
-      RuleName: "iot-ingestion-rule"
+      RuleName: "iot_ingestion_rule"
       TopicRulePayload:
         AwsIotSqlVersion: "2016-03-23"
         RuleDisabled: false
-        Sql: !Sub "SELECT *, topic(1) as thing_name, newuuid() as event_id, timestamp() as time_received FROM 'iot/+'"
+        Sql: !Sub "SELECT timestamp() as time_received FROM 'iot/+'"
         Actions:
           - Lambda:
               FunctionArn: !GetAtt IngestionLambda.Arn
@@ -154,16 +154,16 @@ Resources:
       EventBusName: !GetAtt IotEventBus.Arn
       EventPattern: 
         source: 
-          - proglove.insight.iot-ingestion
+          - iot.ingestion
         detail-type: 
-          - iot-ingestion-event
+          - scan-event
       State: ENABLED
       Targets: 
         - 
           Arn: !GetAtt IotEventDeliveryStream.Arn
           Id: TargetIngestion
           RoleArn: !GetAtt IngestionRuleRole.Arn
-          InputPath: $.detail.payload
+          InputPath: $.detail
           DeadLetterConfig:
             Arn: !GetAtt DeadLetterQueue.Arn
 
@@ -210,12 +210,10 @@ Resources:
         CompressionFormat: GZIP
         Prefix: !Sub "data/year=!{partitionKeyFromQuery:year}/month=!{partitionKeyFromQuery:month}/day=!{partitionKeyFromQuery:day}/"
         ErrorOutputPrefix: ingestion-failed/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/
-        # after discussion how important it is to use the timestamp of the event:
-        # we NEED dyn part. since by default, the ingestion timestamp is used (just think of replays)
         DynamicPartitioningConfiguration:
           Enabled: true
           RetryOptions:
-            DurationInSeconds: 300
+            DurationInSeconds: 60
         ProcessingConfiguration:
           Enabled: true
           Processors:

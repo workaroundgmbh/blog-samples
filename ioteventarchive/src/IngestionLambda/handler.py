@@ -20,7 +20,8 @@ def lambda_handler(event, _: LambdaContext):
             {
                 'Detail': json.dumps(event),
                 'DetailType': 'scan-event',
-                'Source': 'iot.ingestion'
+                'Source': 'iot.ingestion',
+                'EventBusName': EVENT_BUS_ARN
             }
         ]
     )
