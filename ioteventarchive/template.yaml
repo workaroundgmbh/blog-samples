@@ -65,7 +65,7 @@ Resources:
   IngestionQueuePublisherRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "iot-ingestion-role"
+      RoleName: "iot-ingestion-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

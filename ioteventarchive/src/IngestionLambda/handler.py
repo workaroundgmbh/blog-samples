@@ -14,6 +14,9 @@ event_client = boto3.client("events")
 
 @logger.inject_lambda_context(log_event=False, clear_state=True)
 def lambda_handler(event, _: LambdaContext):
+    '''Lambda handler for the Ingestion Lambda function.
+    This function is triggered by the IoT Rule and receives the IoT event, 
+    which is then sent to the EventBridge event bus.'''
 
     response = event_client.put_events(
         Entries=[
